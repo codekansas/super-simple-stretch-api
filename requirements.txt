@@ -1,4 +1,7 @@
 # requirements.txt
 
 numpy
+omegaconf
 psutil
+pyserial
+pyyaml
