@@ -42,7 +42,7 @@ class Device:
     def __init__(self, name: str | None = None, timeout: float | None = None) -> None:
         self.name = name
         self.timeout = timeout
-        self.logger = logging.getLogger(self.name)
+        self.logger = logging.getLogger("device" if self.name is None else f"device.{self.name}")
 
         self.timestamp = DeviceTimestamp()
         self.thread_rate_hz = 25.0

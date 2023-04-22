@@ -44,7 +44,6 @@ module = [
     "ffmpeg.*",
     "liblzfse.*",
     "matplotlib.*",
-    "stretch.*",
     "open3d.*",
     "pandas.*",
     "PIL.*",
@@ -52,6 +51,8 @@ module = [
     "quaternion.*",
     "scipy.*",
     "seaborn.*",
+    "serial.*",
+    "stretch.*",
     "torchvision.*",
     "tqdm.*",
 ]

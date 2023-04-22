@@ -4,8 +4,10 @@ import logging
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Literal
+
+from omegaconf import MISSING
 
 from stretch.device import Device
 from stretch.uart.packing import Bytes, byte_field, flag_field, pack
@@ -299,17 +301,26 @@ class PrintTrace(Bytes):
 
 @dataclass
 class GainsParams:
-    i_contact_pos: float = 0.0
-    i_contact_neg: float = 0.0
+    i_contact_pos: float = field(default=MISSING)
+    i_contact_neg: float = field(default=MISSING)
+
+
+@dataclass
+class MotionParams:
+    vel: float = field(default=MISSING)
+    accel: float = field(default=MISSING)
+    limit_pos: float = field(default=MISSING)
+    limit_neg: float = field(default=MISSING)
 
 
 @dataclass
 class Params:
-    gains: GainsParams = GainsParams()
+    gains: GainsParams = field(default=GainsParams())
+    motion: MotionParams = field(default=MotionParams())
 
 
 class Stepper(Device):
-    def __init__(self, usb: str, name: str | None = None, params: Params = Params()) -> None:
+    def __init__(self, usb: str, params: Params, name: str | None = None) -> None:
         super().__init__(name=usb[5:] if name is None else name)
 
         self.usb = usb
@@ -317,11 +328,15 @@ class Stepper(Device):
 
         self.lock = threading.RLock()
         self.transport = Transport(usb=self.usb)
-        self.logger = logging.getLogger(f"stepper-{usb}")
 
         self.command = Command()
         self.board_info = BoardInfo()
-        self.motion_limits = MotionLimits()
+        self.motion_limits = MotionLimits(
+            limit_neg=params.motion.limit_neg,
+            limit_pos=params.motion.limit_pos,
+        )
+
+        # The protocol of the stepper motor is determined at startup.
         self.protocol: Protocol | None = None
         self._status: StatusP0 | StatusP1 | StatusP2 | None = None
 
@@ -678,12 +693,12 @@ class Stepper(Device):
                 if mode == Mode.VEL_PID or mode == Mode.VEL_TRAJ:
                     self.command.v_des = 0
                 else:
-                    self.command.v_des = self.motion_params.vel
+                    self.command.v_des = self.params.motion.vel
 
             if a_des is not None:
                 self.command.a_des = a_des
             else:
-                self.command.a_des = self.motion_params.accel
+                self.command.a_des = self.params.motion.accel
 
             if stiffness is not None:
                 self.command.stiffness = max(0.0, min(1.0, stiffness))

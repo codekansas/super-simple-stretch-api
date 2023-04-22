@@ -17,7 +17,6 @@ logger = logging.getLogger(__name__)
 class CobbsFraming:
     def __init__(self) -> None:
         self.packet_marker = 0
-        self.timeout = 0.2  # Was .05 but on heavy loads can get starved
         self.warned_last = time.time()
 
     def send_framed_data(self, data: arr.array, size: int, serial: serial.Serial) -> None:
@@ -29,10 +28,10 @@ class CobbsFraming:
         encoded_data.append(0x00)
         serial.write(encoded_data)
 
-    def receive_framed_data(self, buf: arr.array, serial: serial.Serial) -> tuple[int, int]:
+    def receive_framed_data(self, buf: arr.array, serial: serial.Serial, *, timeout: float = 0.2) -> tuple[int, int]:
         t_start = time.time()
         rx_buffer: list[int] = []
-        while (time.time() - t_start) < self.timeout:
+        while (time.time() - t_start) < timeout:
             nn = serial.inWaiting()
             if nn > 0:
                 rbuf = serial.read(nn)
