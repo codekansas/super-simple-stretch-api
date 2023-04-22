@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import Literal, get_args
 
-from stretch.utils.colors import colorize
+from stretch.utils.colors import Color, colorize
 from stretch.utils.formatting import format_time
 from stretch.utils.logging import configure_logging
 
@@ -47,13 +47,11 @@ class Command:
     say: str | None = None
 
 
-def show_help() -> None:
-    get_cmd = lambda s, color, i: (
-        colorize(s[:i], color) +
-        colorize(s[i:i + 1], color, bold=True) +
-        colorize(s[i + 1:], color, bold=False)
-    )
+def get_cmd(s: str, color: Color, i: int = 0) -> str:
+    return colorize(s[:i], color) + colorize(s[i : i + 1], color, bold=True) + colorize(s[i + 1 :], color, bold=False)
 
+
+def show_help() -> None:
     print("Usage:")
     print(f" ↪ {get_cmd('forward', 'cyan', 0)} {colorize('(N meters)', 'grey')} to move forward")
     print(f" ↪ {get_cmd('backward', 'cyan', 0)} {colorize('(N meters)', 'grey')} to move backward")
