@@ -47,9 +47,6 @@ def configure_logging(*, prefix: str | None = None) -> None:
 
     Args:
         prefix: An optional prefix to add to the logger
-        rank: The current rank, or None if not using multiprocessing
-        world_size: The total world size, or None if not using multiprocessing
-        use_tqdm: Write using TQDM instead of sys.stdout
     """
 
     root_logger = logging.getLogger()
