@@ -61,12 +61,21 @@ class ChainConfig:
 
 
 @dataclass
+class CalibrationConfig:
+    range_bounds: tuple[float, float] = field(default=MISSING)
+    contact_thresh_calibration_margin: float = field(default=MISSING)
+    contact_thresh_max: tuple[float, float] = field(default=MISSING)
+
+
+@dataclass
 class StepperConfig:
     usb: str = field(default=MISSING)
     gains: GainsConfig = field(default=GainsConfig())
     motion: MotionConfig = field(default=MotionConfig())
     chain: ChainConfig = field(default=ChainConfig())
+    calibration: CalibrationConfig = field(default=CalibrationConfig())
     rated_current: float = field(default=MISSING)
+    holding_torque: float = field(default=MISSING)
 
 
 @dataclass

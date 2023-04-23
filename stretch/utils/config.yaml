@@ -119,7 +119,7 @@ stepper:
       vel_status_LPF: 10.0
     holding_torque: 1.26
     motion:
-      accel: 15
+      acc: 15
       vel: 25
 
   lift:
@@ -160,5 +160,5 @@ stepper:
       vel_near_setpoint_d: 3.5
       vel_status_LPF: 10.0
     motion:
-      accel: 15
+      acc: 15
       vel: 12
