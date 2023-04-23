@@ -1,11 +1,9 @@
 import array as arr
-import time
 import asyncio
 import fcntl
 import logging
 from typing import Literal, overload
 
-import copy
 import serial
 
 from stretch.uart.cobbs_framing import CobbsFraming

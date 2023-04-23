@@ -1,6 +1,7 @@
 import array as arr
 import copy
 import logging
+import math
 import sys
 import threading
 import time
@@ -1056,3 +1057,29 @@ class Stepper(Device):
                 self.transport.queue_rpc(1, rpc_read_firmware_trace_reply)
                 self.transport.step()
                 time.sleep(sleep_time)
+
+    def motor_rad_to_translate_m(self, ang: float) -> float:
+        """Converts from motor radians to meters of translation.
+
+        Args:
+            ang: The angle in radians
+
+        Returns:
+            The translated motion, derived from the motor properties
+        """
+
+        cfg = self.params.chain
+        return ang * cfg.pitch * cfg.sprocket_teeth / (cfg.gr_spur * math.pi * 2)
+
+    def translate_m_to_motor_rad(self, x: float) -> float:
+        """Converts from meters of translation to motor radians.
+
+        Args:
+            x: The translated motion
+
+        Returns:
+            The angle in radians, derived from the motor properties
+        """
+
+        cfg = self.params.chain
+        return x * cfg.gr_spur * math.pi * 2 / (cfg.pitch * cfg.sprocket_teeth)

@@ -54,10 +54,18 @@ class MotionConfig:
 
 
 @dataclass
+class ChainConfig:
+    sprocket_teeth: int = field(default=MISSING)
+    pitch: float = field(default=MISSING)
+    gr_spur: float = field(default=MISSING)
+
+
+@dataclass
 class StepperConfig:
     usb: str = field(default=MISSING)
     gains: GainsConfig = field(default=GainsConfig())
     motion: MotionConfig = field(default=MotionConfig())
+    chain: ChainConfig = field(default=ChainConfig())
     rated_current: float = field(default=MISSING)
 
 
