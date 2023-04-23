@@ -622,16 +622,10 @@ class Stepper(Device):
             self.trigger.pos_calibrated = True
             self.dirty.trigger = True
 
-    def enable_firmware_trace(self) -> None:
+    def enable_firmware_trace(self, value: bool = True) -> None:
         assert isinstance(self.status, StatusP2), "Only supported on P2"
         with self.lock:
-            self.trigger.enable_trace = True
-            self.dirty.trigger = True
-
-    def disable_firmware_trace(self) -> None:
-        assert isinstance(self.status, StatusP2), "Only supported on P2"
-        with self.lock:
-            self.trigger.disable_trace = True
+            self.trigger.enable_trace = value
             self.dirty.trigger = True
 
     def enable_safety(self) -> None:
@@ -661,28 +655,16 @@ class Stepper(Device):
     def enable_current(self) -> None:
         self.set_command(mode=Mode.CURRENT, i_des=0)
 
-    def enable_sync_mode(self) -> None:
-        self.gains.enable_sync_mode = True
+    def enable_sync_mode(self, value: bool = True) -> None:
+        self.gains.enable_sync_mode = value
         self.dirty.gains = True
 
-    def disable_sync_mode(self) -> None:
-        self.gains.enable_sync_mode = False
+    def enable_runstop(self, value: bool = True) -> None:
+        self.gains.enable_runstop = value
         self.dirty.gains = True
 
-    def enable_runstop(self) -> None:
-        self.gains.enable_runstop = True
-        self.dirty.gains = True
-
-    def disable_runstop(self) -> None:
-        self.gains.enable_runstop = False
-        self.dirty.gains = True
-
-    def enable_guarded_mode(self) -> None:
-        self.gains.enable_guarded_mode = True
-        self.dirty.gains = True
-
-    def disable_guarded_mode(self) -> None:
-        self.gains.enable_guarded_mode = False
+    def enable_guarded_mode(self, value: bool = True) -> None:
+        self.gains.enable_guarded_mode = value
         self.dirty.gains = True
 
     def set_command(
@@ -1057,6 +1039,21 @@ class Stepper(Device):
                 self.transport.queue_rpc(1, rpc_read_firmware_trace_reply)
                 self.transport.step()
                 time.sleep(sleep_time)
+
+    def home(self) -> None:
+        prev_guarded = self.params.gains.enable_guarded_mode
+        prev_sync = self.params.gains.enable_sync_mode
+
+        self.enable_guarded_mode()
+        self.enable_sync_mode(False)
+        self.reset_pos_calibrated()
+
+        self.push_command()
+        self.pull_status()
+
+        self.enable_guarded_mode(prev_guarded)
+        self.enable_sync_mode(prev_sync)
+        self.push_command()
 
     def motor_rad_to_translate_m(self, ang: float) -> float:
         """Converts from motor radians to meters of translation.

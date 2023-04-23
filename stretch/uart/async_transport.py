@@ -11,12 +11,12 @@ from stretch.uart.transport import RPC, Status, TransportError
 
 
 class AsyncTransport:
-    def __init__(self, usb: str, write_timeout: float = 1.0) -> None:
+    def __init__(self, usb: str, name: str | None = None, write_timeout: float = 1.0) -> None:
+        self.name = usb[5:] if name is None else name
         self.usb = usb
         self.write_timeout = write_timeout
 
-        self.logger = logging.getLogger(f"transport.{usb}")
-
+        self.logger = logging.getLogger(f"transport.{self.name}")
         self.lock = asyncio.Lock()
         self.buf = arr.array("B", [0] * (RPC.BLOCK_SIZE * 2))
 
@@ -40,26 +40,30 @@ class AsyncTransport:
         )
 
     async def startup(self) -> None:
+        assert self.ser is None, "Serial port already open"
         async with self.lock:
             self.ser = serial.Serial(self.usb, write_timeout=self.write_timeout)
             assert self.ser.isOpen(), "Serial port not open"
             fcntl.flock(self.ser.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.logger.info("Serial port open")
 
     async def stop(self) -> None:
         assert self.ser is not None, "Serial port not open"
         async with self.lock:
+            self.ser.reset_output_buffer()
+            self.ser.reset_input_buffer()
             self.ser.close()
             self.ser = None
 
     @overload
-    async def step_rpc(self, rpc: arr.array, *, timeout: float = 0.2) -> arr.array | None:
+    async def send(self, rpc: arr.array, *, timeout: float = 0.2) -> arr.array | None:
         ...
 
     @overload
-    async def step_rpc(self, rpc: arr.array, *, timeout: float = 0.2, throw_on_error: Literal[True]) -> arr.array:
+    async def send(self, rpc: arr.array, *, timeout: float = 0.2, throw_on_error: Literal[True]) -> arr.array:
         ...
 
-    async def step_rpc(self, rpc: arr.array, *, timeout: float = 0.2, throw_on_error: bool = False) -> arr.array | None:
+    async def send(self, rpc: arr.array, *, timeout: float = 0.2, throw_on_error: bool = False) -> arr.array | None:
         if self.ser is None:
             raise IOError("Device is not connected; run `transport.startup()` first")
 
