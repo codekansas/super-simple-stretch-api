@@ -3,60 +3,162 @@ logging:
 stepper:
   arm:
     usb: /dev/hello-motor-arm
+    rated_current: 2.8
+    calibration:
+      range_bounds: [0.514, 0.525]
+      contact_thresh_calibration_margin: 10.0
+      contact_thresh_max: [-90.0, 90.0]
+    chain:
+      pitch: 0.0167
+      sprocket_teeth: 10
+      gr_spur: 3.875
     motion:
       acc: 0.14
       vel: 0.14
     gains:
-      effort_LPF: 2.0
-      iMax_neg: -4.35
-      iMax_pos: 4.35
-      i_contact_neg: -3.0
-      i_contact_pos: 3.0
+      effort_LPF: 10.0
+      enable_guarded_mode: true
+      enable_runstop: true
+      enable_sync_mode: true
+      enable_vel_watchdog: false
+      flip_effort_polarity: false
+      flip_encoder_polarity: false
+      iMax_neg: -3.2
+      iMax_pos: 3.2
+      i_contact_neg: -3.2
+      i_contact_pos: 3.2
       i_safety_feedforward: 0.0
-      pKp_d: 12.0
-      pKi_d: 0.01
-      pKd_d: 65.0
-      pKi_limit: 50.0
-      pLPF: 80.0
+      pKd_d: 60.0
+      pKi_d: 0.1
+      pKi_limit: 150
+      pKp_d: 8.0
+      pLPF: 60
       phase_advance_d: 1.8
-      pos_near_setpoint_d: 1.0
+      pos_near_setpoint_d: 2.0
+      safety_hold: false
       safety_stiffness: 1.0
       vKd_d: 0
       vKi_d: 0.005
-      vKp_d: 0.2
       vKi_limit: 200
+      vKp_d: 0.2
       vLPF: 30
       vTe_d: 50
       vel_near_setpoint_d: 3.5
       vel_status_LPF: 10.0
-    rated_current: 2.8
 
   left_wheel:
     usb: /dev/hello-motor-left-wheel
+    rated_current: 2.8
+    holding_torque: 1.26
     motion:
       acc: 15
       vel: 25
     gains:
       effort_LPF: 2.0
-      iMax_neg: -4.35
-      iMax_pos: 4.35
+      enable_guarded_mode: 0
+      enable_runstop: 1
+      enable_sync_mode: 1
+      enable_vel_watchdog: 1
+      flip_effort_polarity: 1
+      flip_encoder_polarity: 1
+      iMax_neg: -2.8
+      iMax_pos: 2.8
       i_contact_neg: -3.0
       i_contact_pos: 3.0
       i_safety_feedforward: 0.0
-      pKp_d: 12.0
-      pKi_d: 0.01
-      pKd_d: 65.0
-      pKi_limit: 50.0
-      pLPF: 80.0
+      pKd_d: 40.0
+      pKi_d: 0.0
+      pKi_limit: 200
+      pKp_d: 8.0
+      pLPF: 200
       phase_advance_d: 1.8
       pos_near_setpoint_d: 1.0
+      safety_hold: 0
       safety_stiffness: 1.0
       vKd_d: 0
       vKi_d: 0.005
-      vKp_d: 0.2
       vKi_limit: 200
+      vKp_d: 0.2
       vLPF: 30
       vTe_d: 50
       vel_near_setpoint_d: 3.5
       vel_status_LPF: 10.0
+
+  right_wheel:
+    usb: /dev/hello-motor-left-wheel
     rated_current: 2.8
+    gains:
+      effort_LPF: 2.0
+      enable_guarded_mode: 0
+      enable_runstop: 1
+      enable_sync_mode: 1
+      enable_vel_watchdog: 1
+      flip_effort_polarity: 0
+      flip_encoder_polarity: 0
+      iMax_neg: -2.8
+      iMax_pos: 2.8
+      i_contact_neg: -3.0
+      i_contact_pos: 3.0
+      i_safety_feedforward: 0.0
+      pKd_d: 40.0
+      pKi_d: 0.0
+      pKi_limit: 200
+      pKp_d: 8.0
+      pLPF: 200
+      phase_advance_d: 1.8
+      pos_near_setpoint_d: 1.0
+      safety_hold: 0
+      safety_stiffness: 1.0
+      vKd_d: 0
+      vKi_d: 0.005
+      vKi_limit: 200
+      vKp_d: 0.2
+      vLPF: 30
+      vTe_d: 50
+      vel_near_setpoint_d: 3.5
+      vel_status_LPF: 10.0
+    holding_torque: 1.26
+    motion:
+      accel: 15
+      vel: 25
+
+  lift:
+    holding_torque: 1.9
+    rated_current: 2.8
+    calibration:
+      range_bounds: [1.094, 1.106]
+      contact_thresh_calibration_margin: 10.0
+      contact_thresh_max: [-100, 100]
+    gains:
+      safety_hold: true
+      effort_LPF: 2.0
+      enable_guarded_mode: true
+      enable_runstop: true
+      enable_sync_mode: true
+      enable_vel_watchdog: false
+      flip_effort_polarity: true
+      flip_encoder_polarity: true
+      iMax_neg: -3.2
+      iMax_pos: 3.2
+      i_contact_neg: -1.5
+      i_contact_pos: 2.0
+      i_safety_feedforward: 0.4
+      pKd_d: 20.0
+      pKi_d: 0.05
+      pKi_limit: 100.0
+      pKp_d: 10.0
+      pLPF: 60
+      phase_advance_d: 1.8
+      pos_near_setpoint_d: 6.0
+      safety_stiffness: 0.0
+      vKd_d: 0
+      vKi_d: 0.005
+      vKi_limit: 200
+      vKp_d: 0.2
+      vLPF: 30
+      vTe_d: 50
+      vel_near_setpoint_d: 3.5
+      vel_status_LPF: 10.0
+    motion:
+      accel: 15
+      vel: 12
