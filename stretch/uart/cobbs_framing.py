@@ -14,6 +14,10 @@ import serial
 logger = logging.getLogger(__name__)
 
 
+class TimeoutException(Exception):
+    pass
+
+
 class CobbsFraming:
     def __init__(self) -> None:
         self.packet_marker = 0
@@ -28,10 +32,16 @@ class CobbsFraming:
         encoded_data.append(0x00)
         serial.write(encoded_data)
 
-    def receive_framed_data(self, buf: arr.array, serial: serial.Serial, *, timeout: float = 0.2) -> tuple[int, int]:
+    def receive_framed_data(
+        self,
+        buf: arr.array,
+        serial: serial.Serial,
+        *,
+        timeout: float | None = 0.2,
+    ) -> tuple[int, int]:
         t_start = time.time()
         rx_buffer: list[int] = []
-        while (time.time() - t_start) < timeout:
+        while timeout is None or (time.time() - t_start) < timeout:
             nn = serial.inWaiting()
             if nn > 0:
                 rbuf = serial.read(nn)
@@ -46,6 +56,10 @@ class CobbsFraming:
                         return crc1 == crc2, nr
                     else:
                         rx_buffer.append(byte_in)
+
+        if timeout is not None and (time.time() - t_start) > timeout:
+            raise TimeoutException("Timeout waiting for data")
+
         return 0, 0
 
     def calc_crc(self, buf: arr.array, nr: int) -> int:
