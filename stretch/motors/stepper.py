@@ -4,14 +4,13 @@ import logging
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Literal
-
-from omegaconf import MISSING
 
 from stretch.motors.device import Device
 from stretch.uart.packing import Bytes, byte_field, flag_field, pack
 from stretch.uart.transport import Transport
+from stretch.utils.config import StepperConfig
 from stretch.utils.trajectories import PolyCoefs
 
 logger = logging.getLogger(__name__)
@@ -299,41 +298,28 @@ class PrintTrace(Bytes):
     x: float = byte_field("float")
 
 
-@dataclass
-class GainsParams:
-    i_contact_pos: float = field(default=MISSING)
-    i_contact_neg: float = field(default=MISSING)
-
-
-@dataclass
-class MotionParams:
-    vel: float = field(default=MISSING)
-    accel: float = field(default=MISSING)
-    limit_pos: float = field(default=MISSING)
-    limit_neg: float = field(default=MISSING)
-
-
-@dataclass
-class Params:
-    gains: GainsParams = field(default=GainsParams())
-    motion: MotionParams = field(default=MotionParams())
-
-
 class Stepper(Device):
-    def __init__(self, usb: str, params: Params, name: str | None = None) -> None:
-        super().__init__(name=usb[5:] if name is None else name)
+    def __init__(self, params: StepperConfig, name: str | None = None) -> None:
+        super().__init__(name=params.usb[5:] if name is None else name)
 
-        self.usb = usb
+        self.usb = params.usb
         self.params = params
 
         self.lock = threading.RLock()
         self.transport = Transport(usb=self.usb)
 
-        self.command = Command()
         self.board_info = BoardInfo()
         self.motion_limits = MotionLimits(
             limit_neg=params.motion.limit_neg,
             limit_pos=params.motion.limit_pos,
+        )
+
+        # Copies command from stepper configuration.
+        self.command = Command(
+            i_contact_neg=params.gains.i_contact_neg,
+            i_contact_pos=params.gains.i_contact_pos,
+            stiffness=params.gains.safety_stiffness,
+            i_feedforward=params.gains.i_safety_feedforward,
         )
 
         # The protocol of the stepper motor is determined at startup.
@@ -346,19 +332,51 @@ class Stepper(Device):
         self.waypoint_next_traj_response: WaypointTrajectoryResponse | None = None
 
         # Traces, used by P2.
-        self.status_trace = copy.deepcopy(self.status)
+        self.status_trace: StatusP0 | StatusP1 | StatusP2 | None = None
         self.debug_trace: DebugTrace | None = None
         self.print_trace: PrintTrace | None = None
         self.n_trace_read = 0
 
         self.ts_last_syncd_motion: float = 0.0
-        self.dirty = Dirty()
         self.trigger = Trigger()
         self.trigger_position = 0.0
         self.load_test_payload = arr.array("B", range(256)) * 4
         self.hw_valid = False
-        self.gains = Gains()
+
+        # Copies gains from stepper configuration.
+        self.gains = Gains(
+            pKp_d=params.gains.pKp_d,
+            pKi_d=params.gains.pKi_d,
+            pKd_d=params.gains.pKd_d,
+            pLPF=params.gains.pLPF,
+            pKi_limit=params.gains.pKi_limit,
+            vKp_d=params.gains.vKp_d,
+            vKi_d=params.gains.vKi_d,
+            vKd_d=params.gains.vKd_d,
+            vLPF=params.gains.vLPF,
+            vKi_limit=params.gains.vKi_limit,
+            vTe_d=params.gains.vTe_d,
+            iMax_pos=params.gains.iMax_pos,
+            iMax_neg=params.gains.iMax_neg,
+            phase_advance_d=params.gains.phase_advance_d,
+            pos_near_setpoint_d=params.gains.pos_near_setpoint_d,
+            vel_near_setpoint_d=params.gains.vel_near_setpoint_d,
+            vel_status_LPF=params.gains.vel_status_LPF,
+            effort_LPF=params.gains.effort_LPF,
+            safety_stiffness=params.gains.safety_stiffness,
+            i_safety_feedforward=params.gains.i_safety_feedforward,
+            safety_hold=params.gains.safety_hold,
+            enable_runstop=params.gains.enable_runstop,
+            enable_sync_mode=params.gains.enable_sync_mode,
+            enable_guarded_mode=params.gains.enable_guarded_mode,
+            flip_encoder_polarity=params.gains.flip_encoder_polarity,
+            flip_effort_polarity=params.gains.flip_effort_polarity,
+            enable_vel_watchdog=params.gains.enable_vel_watchdog,
+        )
         self.gains_flash = copy.deepcopy(self.gains)
+
+        # Set `command` and `gains` to dirty at start to copy over params.
+        self.dirty = Dirty(command=True, gains=True)
 
     @property
     def status(self) -> StatusP0 | StatusP1 | StatusP2:
@@ -698,17 +716,17 @@ class Stepper(Device):
             if a_des is not None:
                 self.command.a_des = a_des
             else:
-                self.command.a_des = self.params.motion.accel
+                self.command.a_des = self.params.motion.acc
 
             if stiffness is not None:
                 self.command.stiffness = max(0.0, min(1.0, stiffness))
             else:
-                self.command.stiffness = 1
+                self.command.stiffness = 1.0
 
             if i_feedforward is not None:
                 self.command.i_feedforward = i_feedforward
             else:
-                self.command.i_feedforward = 0
+                self.command.i_feedforward = 0.0
 
             if i_des is not None and mode == Mode.CURRENT:
                 self.command.i_feedforward = i_des

@@ -1,0 +1,62 @@
+logging:
+  level: INFO
+stepper:
+  arm:
+    usb: /dev/hello-motor-arm
+    motion:
+      acc: 0.14
+      vel: 0.14
+    gains:
+      effort_LPF: 2.0
+      iMax_neg: -4.35
+      iMax_pos: 4.35
+      i_contact_neg: -3.0
+      i_contact_pos: 3.0
+      i_safety_feedforward: 0.0
+      pKp_d: 12.0
+      pKi_d: 0.01
+      pKd_d: 65.0
+      pKi_limit: 50.0
+      pLPF: 80.0
+      phase_advance_d: 1.8
+      pos_near_setpoint_d: 1.0
+      safety_stiffness: 1.0
+      vKd_d: 0
+      vKi_d: 0.005
+      vKp_d: 0.2
+      vKi_limit: 200
+      vLPF: 30
+      vTe_d: 50
+      vel_near_setpoint_d: 3.5
+      vel_status_LPF: 10.0
+    rated_current: 2.8
+
+  left_wheel:
+    usb: /dev/hello-motor-left-wheel
+    motion:
+      acc: 15
+      vel: 25
+    gains:
+      effort_LPF: 2.0
+      iMax_neg: -4.35
+      iMax_pos: 4.35
+      i_contact_neg: -3.0
+      i_contact_pos: 3.0
+      i_safety_feedforward: 0.0
+      pKp_d: 12.0
+      pKi_d: 0.01
+      pKd_d: 65.0
+      pKi_limit: 50.0
+      pLPF: 80.0
+      phase_advance_d: 1.8
+      pos_near_setpoint_d: 1.0
+      safety_stiffness: 1.0
+      vKd_d: 0
+      vKi_d: 0.005
+      vKp_d: 0.2
+      vKi_limit: 200
+      vLPF: 30
+      vTe_d: 50
+      vel_near_setpoint_d: 3.5
+      vel_status_LPF: 10.0
+    rated_current: 2.8

@@ -1,9 +1,11 @@
 import array as arr
+import time
 import asyncio
 import fcntl
 import logging
 from typing import Literal, overload
 
+import copy
 import serial
 
 from stretch.uart.cobbs_framing import CobbsFraming
@@ -52,14 +54,14 @@ class AsyncTransport:
             self.ser = None
 
     @overload
-    async def send(self, rpc: arr.array, *, timeout: float = 0.2) -> arr.array | None:
+    async def step_rpc(self, rpc: arr.array, *, timeout: float = 0.2) -> arr.array | None:
         ...
 
     @overload
-    async def send(self, rpc: arr.array, *, timeout: float = 0.2, throw_on_error: Literal[True]) -> arr.array:
+    async def step_rpc(self, rpc: arr.array, *, timeout: float = 0.2, throw_on_error: Literal[True]) -> arr.array:
         ...
 
-    async def send(self, rpc: arr.array, *, timeout: float = 0.2, throw_on_error: bool = False) -> arr.array | None:
+    async def step_rpc(self, rpc: arr.array, *, timeout: float = 0.2, throw_on_error: bool = False) -> arr.array | None:
         if self.ser is None:
             raise IOError("Device is not connected; run `transport.startup()` first")
 

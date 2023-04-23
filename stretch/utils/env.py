@@ -7,6 +7,7 @@ Instead, add a new accessor function to this file.
 
 import os
 from pathlib import Path
+from typing import Callable
 
 
 class _StrEnvVar:
@@ -94,13 +95,19 @@ class _PathEnvVar:
 
 
 class _PathEnvVarWithDefault(_PathEnvVar):
-    def __init__(self, key: str, default: Path, *, suffix: str | None = None) -> None:
+    def __init__(self, key: str, default: Path | Callable[[], Path], *, suffix: str | None = None) -> None:
         super().__init__(key, suffix=suffix)
 
-        self.default = default
+        self._default = default
 
     def get(self) -> Path:
         return self.maybe_get()
+
+    @property
+    def default(self) -> Path:
+        if callable(self._default):
+            return self._default()
+        return self._default
 
     def maybe_get(self) -> Path:
         return Path(os.environ[self.key]).resolve() if self.key in os.environ else self.default
@@ -125,3 +132,11 @@ set_fleet_id = FleetID.set
 FleetPath = _PathEnvVarWithDefault("HELLO_FLEET_PATH", default=Path("/tmp/"))
 get_fleet_path = FleetPath.get
 set_fleet_path = FleetPath.set
+
+# The path to the device config file.
+DeviceConfigPath = _PathEnvVarWithDefault(
+    "HELLO_DEVICE_CONFIG_PATH",
+    default=lambda: (Path(__file__).parent / "config.yaml").resolve(),
+)
+get_device_config_path = DeviceConfigPath.get
+set_device_config_path = DeviceConfigPath.set

@@ -373,13 +373,13 @@ class Bytes(ABC):
             value = getattr(self, f.name)
             match dtype:
                 case "string":
-                    assert isinstance(value, str), f"Expected str, got {type(value)}"
+                    assert isinstance(value, str), f"Expected str for {f.name}, got {value}"
                     values.append((value, dtype))
                 case "float" | "double":
-                    assert isinstance(value, float), f"Expected float, got {type(value)}"
+                    assert isinstance(value, float), f"Expected float for {f.name}, got {value}"
                     values.append((value, dtype))
                 case "int8" | "uint8" | "int16" | "uint16" | "int32" | "uint32" | "int64" | "uint64":
-                    assert isinstance(value, int), f"Expected int, got {type(value)}"
+                    assert isinstance(value, int), f"Expected int for {f.name}, got {value}"
                     values.append((value, dtype))
                 case _:
                     raise NotImplementedError(f"Unsupported packing dtype: {dtype}")
