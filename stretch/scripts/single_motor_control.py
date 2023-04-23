@@ -1,10 +1,8 @@
 import argparse
 import asyncio
 import logging
-import time
 
-from stretch.motors.async_stepper import AsyncStepper
-from stretch.motors.stepper import Mode
+from stretch.motors.async_stepper import AsyncStepper, Mode
 from stretch.utils.config import Config
 from stretch.utils.logging import configure_logging
 
@@ -30,10 +28,19 @@ async def main() -> None:
     await stepper.startup()
 
     await stepper.send_load_test_payload()
+
+    stepper.gains.enable_guarded_mode = True
+    stepper.gains.enable_sync_mode = False
     await stepper.send_gains()
 
-    # await stepper.run_command(mode=Mode.POS_TRAJ_INCR, x_des=0.2)
+    await stepper.send_trigger(reset_pos_calibrated=True)
 
+    await stepper.run_command(
+        mode=Mode.POS_TRAJ_INCR,
+        x_des=stepper.translate_m_to_motor_rad(0.05),
+    )
+
+    logger.info("Done; sleeping...")
     await asyncio.sleep(1.0)
 
     # Stops the stepper motor.

@@ -1,8 +1,9 @@
 import array as arr
 import asyncio
 import logging
+import math
 
-from stretch.motors.stepper import RPC, BoardInfo, Command, Gains, Mode, Protocol
+from stretch.motors.stepper import RPC, BoardInfo, Command, Gains, Mode, Protocol, Trigger
 from stretch.uart.async_transport import AsyncTransport
 from stretch.utils.config import StepperConfig
 
@@ -95,6 +96,37 @@ class AsyncStepper:
         async with self.lock:
             await self.transport.stop()
 
+    async def send_trigger(
+        self,
+        mark_pos: bool = False,
+        reset_motion_gen: bool = False,
+        board_reset: bool = False,
+        write_gains_to_flash: bool = False,
+        reset_pos_calibrated: bool = False,
+        pos_calibrated: bool = False,
+        mark_pos_on_contact: bool = False,
+        enable_trace: bool = False,
+        disable_trace: bool = False,
+    ) -> None:
+        trigger = Trigger()
+        trigger.mark_pos = mark_pos
+        trigger.reset_motion_gen = reset_motion_gen
+        trigger.board_reset = board_reset
+        trigger.write_gains_to_flash = write_gains_to_flash
+        trigger.reset_pos_calibrated = reset_pos_calibrated
+        trigger.pos_calibrated = pos_calibrated
+        trigger.mark_pos_on_contact = mark_pos_on_contact
+        trigger.enable_trace = enable_trace
+        trigger.disable_trace = disable_trace
+
+        async with self.lock:
+            payload = arr.array("B", [RPC.REPLY_SET_TRIGGER] + [0] * trigger.total_bytes())
+            trigger.pack(payload, 1)
+            reply = await self.transport.send(payload, throw_on_error=True)
+            breakpoint()
+            if reply[0] != RPC.REPLY_SET_TRIGGER:
+                self.logger.error("Error setting trigger: %d", reply[0])
+
     async def send_load_test_payload(self) -> None:
         async with self.lock:
             payload = arr.array("B", [RPC.LOAD_TEST]) + self.load_test_payload
@@ -113,6 +145,32 @@ class AsyncStepper:
             reply = await self.transport.send(payload, throw_on_error=True)
             if reply[0] != RPC.REPLY_GAINS:
                 self.logger.error("Error setting command: %d", reply[0])
+
+    def motor_rad_to_translate_m(self, ang: float) -> float:
+        """Converts from motor radians to meters of translation.
+
+        Args:
+            ang: The angle in radians
+
+        Returns:
+            The translated motion, derived from the motor properties
+        """
+
+        cfg = self.params.chain
+        return ang * cfg.pitch * cfg.sprocket_teeth / (cfg.gr_spur * math.pi * 2)
+
+    def translate_m_to_motor_rad(self, x: float) -> float:
+        """Converts from meters of translation to motor radians.
+
+        Args:
+            x: The translated motion
+
+        Returns:
+            The angle in radians, derived from the motor properties
+        """
+
+        cfg = self.params.chain
+        return x * cfg.gr_spur * math.pi * 2 / (cfg.pitch * cfg.sprocket_teeth)
 
     async def run_command(
         self,

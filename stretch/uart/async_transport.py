@@ -45,7 +45,7 @@ class AsyncTransport:
             self.ser = serial.Serial(self.usb, write_timeout=self.write_timeout)
             assert self.ser.isOpen(), "Serial port not open"
             fcntl.flock(self.ser.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            self.logger.info("Serial port open")
+            self.logger.debug("Serial port open")
 
     async def stop(self) -> None:
         assert self.ser is not None, "Serial port not open"
@@ -54,6 +54,7 @@ class AsyncTransport:
             self.ser.reset_input_buffer()
             self.ser.close()
             self.ser = None
+            self.logger.debug("Serial port closed")
 
     @overload
     async def send(self, rpc: arr.array, *, timeout: float = 0.2) -> arr.array | None:
