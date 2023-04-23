@@ -85,7 +85,7 @@ stepper:
       vel_status_LPF: 10.0
 
   right_wheel:
-    usb: /dev/hello-motor-left-wheel
+    usb: /dev/hello-motor-right-wheel
     rated_current: 2.8
     gains:
       effort_LPF: 2.0
@@ -123,6 +123,7 @@ stepper:
       vel: 25
 
   lift:
+    usb: /dev/hello-motor-lift
     holding_torque: 1.9
     rated_current: 2.8
     calibration:

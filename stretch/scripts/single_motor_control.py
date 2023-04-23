@@ -29,14 +29,12 @@ async def main() -> None:
     # Starts the stepper motor.
     await stepper.startup()
 
-    await stepper.run_command(
-        mode=Mode.POS_TRAJ,
-        x_des=0.1,
-        v_des=0.0,
-        a_des=0.0,
-    )
+    await stepper.send_load_test_payload()
+    await stepper.send_gains()
 
-    time.sleep(1.0)
+    # await stepper.run_command(mode=Mode.POS_TRAJ_INCR, x_des=0.2)
+
+    await asyncio.sleep(1.0)
 
     # Stops the stepper motor.
     await stepper.stop()

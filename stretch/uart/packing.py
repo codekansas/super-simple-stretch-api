@@ -376,8 +376,8 @@ class Bytes(ABC):
                     assert isinstance(value, str), f"Expected str for {f.name}, got {value}"
                     values.append((value, dtype))
                 case "float" | "double":
-                    assert isinstance(value, float), f"Expected float for {f.name}, got {value}"
-                    values.append((value, dtype))
+                    assert isinstance(value, (int, float)), f"Expected float for {f.name}, got {value}"
+                    values.append((float(value), dtype))
                 case "int8" | "uint8" | "int16" | "uint16" | "int32" | "uint32" | "int64" | "uint64":
                     assert isinstance(value, int), f"Expected int for {f.name}, got {value}"
                     values.append((value, dtype))

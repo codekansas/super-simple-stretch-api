@@ -2,7 +2,7 @@ import array as arr
 import asyncio
 import logging
 
-from stretch.motors.stepper import RPC, BoardInfo, Command, Mode, Protocol
+from stretch.motors.stepper import RPC, BoardInfo, Command, Gains, Mode, Protocol
 from stretch.uart.async_transport import AsyncTransport
 from stretch.utils.config import StepperConfig
 
@@ -16,6 +16,40 @@ class AsyncStepper:
         self.logger = logging.getLogger(f"stepper.{self.name}")
         self.lock = asyncio.Lock()
         self.transport = AsyncTransport(usb=self.usb, name=self.name)
+
+        # Test payload.
+        self.load_test_payload = arr.array("B", range(256)) * 4
+
+        # Copies gains from stepper configuration.
+        self.gains = Gains(
+            pKp_d=params.gains.pKp_d,
+            pKi_d=params.gains.pKi_d,
+            pKd_d=params.gains.pKd_d,
+            pLPF=params.gains.pLPF,
+            pKi_limit=params.gains.pKi_limit,
+            vKp_d=params.gains.vKp_d,
+            vKi_d=params.gains.vKi_d,
+            vKd_d=params.gains.vKd_d,
+            vLPF=params.gains.vLPF,
+            vKi_limit=params.gains.vKi_limit,
+            vTe_d=params.gains.vTe_d,
+            iMax_pos=params.gains.iMax_pos,
+            iMax_neg=params.gains.iMax_neg,
+            phase_advance_d=params.gains.phase_advance_d,
+            pos_near_setpoint_d=params.gains.pos_near_setpoint_d,
+            vel_near_setpoint_d=params.gains.vel_near_setpoint_d,
+            vel_status_LPF=params.gains.vel_status_LPF,
+            effort_LPF=params.gains.effort_LPF,
+            safety_stiffness=params.gains.safety_stiffness,
+            i_safety_feedforward=params.gains.i_safety_feedforward,
+            safety_hold=params.gains.safety_hold,
+            enable_runstop=params.gains.enable_runstop,
+            enable_sync_mode=params.gains.enable_sync_mode,
+            enable_guarded_mode=params.gains.enable_guarded_mode,
+            flip_encoder_polarity=params.gains.flip_encoder_polarity,
+            flip_effort_polarity=params.gains.flip_effort_polarity,
+            enable_vel_watchdog=params.gains.enable_vel_watchdog,
+        )
 
         # Copies command from stepper configuration.
         self.command = Command(
@@ -61,6 +95,25 @@ class AsyncStepper:
         async with self.lock:
             await self.transport.stop()
 
+    async def send_load_test_payload(self) -> None:
+        async with self.lock:
+            payload = arr.array("B", [RPC.LOAD_TEST]) + self.load_test_payload
+            reply = (await self.transport.send(payload, throw_on_error=True))[1:]
+            for i in range(1024):
+                if reply[i] != (p := self.load_test_payload[(i + 1) % 1024]):
+                    self.logger.warning("Load test bad data; %d != %d", reply[i + 1], p)
+                    break
+            else:
+                self.load_test_payload = reply
+
+    async def send_gains(self) -> None:
+        async with self.lock:
+            payload = arr.array("B", [RPC.SET_GAINS] + [0] * self.gains.total_bytes())
+            self.gains.pack(payload, 1)
+            reply = await self.transport.send(payload, throw_on_error=True)
+            if reply[0] != RPC.REPLY_GAINS:
+                self.logger.error("Error setting command: %d", reply[0])
+
     async def run_command(
         self,
         mode: int | None = None,
@@ -89,7 +142,7 @@ class AsyncStepper:
             i_contact_neg: The negative contact current to move at.
         """
 
-        with self.lock:
+        async with self.lock:
             if mode is not None:
                 self.command.mode = mode
 
