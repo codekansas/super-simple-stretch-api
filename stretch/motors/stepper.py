@@ -406,6 +406,7 @@ class Stepper(Device):
         """
 
         def rpc_board_info_reply(reply: arr.array) -> None:
+            breakpoint()
             if reply[0] == RPC.REPLY_STEPPER_BOARD_INFO:
                 self.board_info, _ = BoardInfo.unpack(reply[1:])
             else:
