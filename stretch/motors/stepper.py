@@ -9,7 +9,7 @@ from typing import Callable, Literal
 
 from omegaconf import MISSING
 
-from stretch.device import Device
+from stretch.motors.device import Device
 from stretch.uart.packing import Bytes, byte_field, flag_field, pack
 from stretch.uart.transport import Transport
 from stretch.utils.trajectories import PolyCoefs
