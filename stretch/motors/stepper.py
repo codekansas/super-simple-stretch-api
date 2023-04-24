@@ -1,20 +1,13 @@
 import array as arr
-import copy
+import asyncio
 import logging
 import math
-import sys
-import threading
-import time
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import Literal
 
-from stretch.motors.device import Device
-from stretch.uart.packing import Bytes, byte_field, flag_field, pack
+from stretch.uart.packing import Bytes, byte_field, flag_field
 from stretch.uart.transport import Transport
 from stretch.utils.config import StepperConfig
-from stretch.utils.trajectories import PolyCoefs
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -299,50 +292,23 @@ class PrintTrace(Bytes):
     x: float = byte_field("float")
 
 
-class Stepper(Device):
+class Stepper:
     def __init__(self, params: StepperConfig, name: str | None = None) -> None:
-        super().__init__(name=params.usb[5:] if name is None else name)
-
+        self.name = params.usb[5:] if name is None else name
         self.usb = params.usb
         self.params = params
 
-        self.lock = threading.RLock()
-        self.transport = Transport(usb=self.usb)
-
-        self.board_info = BoardInfo()
         self.motion_limits = MotionLimits(
             limit_neg=params.motion.limit_neg,
             limit_pos=params.motion.limit_pos,
         )
 
-        # Copies command from stepper configuration.
-        self.command = Command(
-            i_contact_neg=params.gains.i_contact_neg,
-            i_contact_pos=params.gains.i_contact_pos,
-            stiffness=params.gains.safety_stiffness,
-            i_feedforward=params.gains.i_safety_feedforward,
-        )
+        self.logger = logging.getLogger(f"stepper.{self.name}")
+        self.lock = asyncio.Lock()
+        self.transport = Transport(usb=self.usb, name=self.name)
 
-        # The protocol of the stepper motor is determined at startup.
-        self.protocol: Protocol | None = None
-        self._status: StatusP0 | StatusP1 | StatusP2 | None = None
-
-        # Waypoints, used by P1.
-        self.waypoint_traj: WaypointTrajectory | None = None
-        self.waypoint_traj_response: WaypointTrajectoryResponse | None = None
-        self.waypoint_next_traj_response: WaypointTrajectoryResponse | None = None
-
-        # Traces, used by P2.
-        self.status_trace: StatusP0 | StatusP1 | StatusP2 | None = None
-        self.debug_trace: DebugTrace | None = None
-        self.print_trace: PrintTrace | None = None
-        self.n_trace_read = 0
-
-        self.ts_last_syncd_motion: float = 0.0
-        self.trigger = Trigger()
-        self.trigger_position = 0.0
+        # Test payload.
         self.load_test_payload = arr.array("B", range(256)) * 4
-        self.hw_valid = False
 
         # Copies gains from stepper configuration.
         self.gains = Gains(
@@ -374,17 +340,59 @@ class Stepper(Device):
             flip_effort_polarity=params.gains.flip_effort_polarity,
             enable_vel_watchdog=params.gains.enable_vel_watchdog,
         )
-        self.gains_flash = copy.deepcopy(self.gains)
 
-        # Set `command` and `gains` to dirty at start to copy over params.
-        self.dirty = Dirty(command=True, gains=True)
+        # Copies command from stepper configuration.
+        self.command = Command(
+            mode=Mode.SAFETY,
+            x_des=0.0,
+            v_des=params.motion.vel,
+            a_des=params.motion.acc,
+            stiffness=1.0,
+            i_feedforward=0.0,
+            i_contact_pos=params.gains.i_contact_pos,
+            i_contact_neg=params.gains.i_contact_neg,
+        )
+
+        # Read from the board.
+        self._board_info: BoardInfo | None = None
+        self._protocol: Protocol | None = None
+        self._status: StatusP0 | StatusP1 | StatusP2 | None = None
+
+    async def startup(self) -> None:
+        async with self.lock:
+            await self.transport.startup()
+
+            reply = await self.transport.send(arr.array("B", [RPC.GET_STEPPER_BOARD_INFO]))
+            if reply[0] != RPC.REPLY_STEPPER_BOARD_INFO:
+                raise IOError(f"Unexpected reply: {reply[0]}")
+            self._board_info, _ = BoardInfo.unpack(reply[1:])
+
+            match self._board_info.protocol_version:
+                case "p0":
+                    self._protocol = "P0"
+                case "p1":
+                    self._protocol = "P1"
+                case "p2":
+                    self._protocol = "P2"
+                case _:
+                    self.logger.error(
+                        "Firmware protocol mismatch. Protocol on board is %s. Disabling device. "
+                        "Please upgrade the firmware or version running on the Stretch.",
+                        self._board_info.protocol_version,
+                    )
+                    await self.transport.stop()
+
+            # Logs protocol.
+            self.logger.info("Protocol: %s", self._protocol)
+
+            await self.send_command(mode=Mode.SAFETY)
 
     @property
     def status(self) -> StatusP0 | StatusP1 | StatusP2:
         if self._status is None:
-            if self.protocol is None:
-                raise RuntimeError("Protocol not yet set; need to call `startup()` first.")
-            match self.protocol:
+            if self._protocol is None:
+                raise RuntimeError("Protocol not yet set; `startup()` needs to succeed first.")
+            match self._protocol:
                 case "P0":
                     self._status = StatusP0()
                 case "P1":
@@ -392,283 +400,120 @@ class Stepper(Device):
                 case "P2":
                     self._status = StatusP2()
                 case _:
-                    raise ValueError(f"Invalid status type: {self.protocol}")
+                    raise ValueError(f"Invalid status type: {self._protocol}")
         return self._status
 
-    def startup(self, threaded: bool = False) -> bool:
-        """Starts the stepper motor.
+    @property
+    def board_info(self) -> BoardInfo:
+        assert self._board_info is not None, "Board info not read yet; call startup() first."
+        return self._board_info
 
-        Args:
-            threaded: If True, starts the stepper motor in a separate thread.
+    async def stop(self) -> None:
+        async with self.lock:
+            await self.send_command(mode=Mode.SAFETY)
+            await self.transport.stop()
 
-        Returns:
-            True if the stepper motor was started successfully.
-        """
+    async def pull_gains(self) -> None:
+        with self.lock:
+            reply = await self.transport.send(arr.array("B", [RPC.READ_GAINS_FROM_FLASH]))
+            if reply[0] != RPC.REPLY_GAINS:
+                raise IOError(f"Unexpected reply: {reply[0]}")
+            self.gains, _ = self.gains.unpack(reply[1:])
 
-        def rpc_board_info_reply(reply: arr.array) -> None:
+    async def pull_status(self) -> None:
+        with self.lock:
+            reply = await self.transport.send(arr.array("B", [RPC.GET_STATUS]))
+            if reply[0] != RPC.REPLY_STATUS:
+                raise IOError(f"Unexpected reply: {reply[0]}")
+            self._status, _ = self.status.unpack(reply[1:])
+
+    async def send_trigger(
+        self,
+        mark_pos: bool = False,
+        reset_motion_gen: bool = False,
+        board_reset: bool = False,
+        write_gains_to_flash: bool = False,
+        reset_pos_calibrated: bool = False,
+        pos_calibrated: bool = False,
+        mark_pos_on_contact: bool = False,
+        enable_trace: bool = False,
+        disable_trace: bool = False,
+    ) -> None:
+        trigger = Trigger()
+        trigger.mark_pos = mark_pos
+        trigger.reset_motion_gen = reset_motion_gen
+        trigger.board_reset = board_reset
+        trigger.write_gains_to_flash = write_gains_to_flash
+        trigger.reset_pos_calibrated = reset_pos_calibrated
+        trigger.pos_calibrated = pos_calibrated
+        trigger.mark_pos_on_contact = mark_pos_on_contact
+        trigger.enable_trace = enable_trace
+        trigger.disable_trace = disable_trace
+
+        async with self.lock:
+            payload = arr.array("B", [RPC.REPLY_SET_TRIGGER] + [0] * trigger.total_bytes())
+            trigger.pack(payload, 1)
+            reply = await self.transport.send(payload)
             breakpoint()
-            if reply[0] == RPC.REPLY_STEPPER_BOARD_INFO:
-                self.board_info, _ = BoardInfo.unpack(reply[1:])
+            if reply[0] != RPC.REPLY_SET_TRIGGER:
+                self.logger.error("Error setting trigger: %d", reply[0])
+
+    async def send_load_test_payload(self) -> None:
+        async with self.lock:
+            payload = arr.array("B", [RPC.LOAD_TEST]) + self.load_test_payload
+            reply = (await self.transport.send(payload))[1:]
+            for i in range(1024):
+                if reply[i] != (p := self.load_test_payload[(i + 1) % 1024]):
+                    self.logger.warning("Load test bad data; %d != %d", reply[i + 1], p)
+                    break
             else:
-                self.logger.error("Error RPC_REPLY_STEPPER_BOARD_INFO, %d", reply[0])
+                self.load_test_payload = reply
 
-        try:
-            super().startup(threaded=threaded)
+    async def send_gains(self) -> None:
+        async with self.lock:
+            payload = arr.array("B", [RPC.SET_GAINS] + [0] * self.gains.total_bytes())
+            self.gains.pack(payload, 1)
+            reply = await self.transport.send(payload)
+            if reply[0] != RPC.REPLY_GAINS:
+                self.logger.error("Error setting command: %d", reply[0])
 
-            with self.lock:
-                self.hw_valid = self.transport.startup()
-                if self.hw_valid:
-                    self.transport.payload_out[0] = RPC.GET_STEPPER_BOARD_INFO
-                    self.transport.queue_rpc(1, rpc_board_info_reply)
-                    self.transport.step(exiting=False)
-
-                    match self.board_info.protocol_version:
-                        case "p0":
-                            self.protocol = "P0"
-                        case "p1":
-                            self.protocol = "P1"
-                        case "p2":
-                            self.protocol = "P2"
-                        case _:
-                            self.logger.error(
-                                "Firmware protocol mismatch. Protocol on board is %s. Disabling device. "
-                                "Please upgrade the firmware or version running on the Stretch.",
-                                self.board_info.protocol_version,
-                            )
-                            self.hw_valid = False
-                            self.transport.stop()
-                            return False
-
-                    self.enable_safety()
-                    self.dirty.gains = True
-                    self.pull_status()
-                    self.push_command()
-
-                    return True
-                return False
-
-        except KeyError:
-            self.hw_valid = False
-            return False
-
-    def stop(self) -> None:
-        super().stop()
-
-        if not self.hw_valid:
-            return
-
-        with self.lock:
-            self.logger.debug("Shutting down")
-            self.enable_safety()
-            self.push_command(exiting=True)
-            self.transport.stop()
-            self.hw_valid = False
-
-    def is_sync_required(self, ts_last_sync: float) -> bool:
-        return self.status.in_sync_mode and self.ts_last_syncd_motion > ts_last_sync
-
-    def push_command(self, exiting: bool = False) -> None:
-        if not self.hw_valid:
-            return
-
-        with self.lock:
-            if self.dirty.load_test:
-
-                def rpc_load_test_reply(reply: arr.array) -> None:
-                    if reply[0] == RPC.REPLY_LOAD_TEST:
-                        d = reply[1:]
-                        for i in range(1024):
-                            if d[i] != (p := self.load_test_payload[(i + 1) % 1024]):
-                                self.logger.debug("Load test bad data; %d != %d", d[i], p)
-                        self.load_test_payload = d
-                    else:
-                        self.logger.error("Error RPC_REPLY_LOAD_TEST, %d", reply[0])
-
-                self.transport.payload_out[0] = RPC.LOAD_TEST
-                self.transport.payload_out[1:] = self.load_test_payload
-                self.transport.queue_rpc2(1024 + 1, rpc_load_test_reply)
-                self.dirty.load_test = False
-
-            if self.dirty.trigger:
-
-                def rpc_trigger_reply(reply: arr.array) -> None:
-                    if reply[0] != RPC.REPLY_SET_TRIGGER:
-                        self.logger.error("Error RPC_REPLY_SET_TRIGGER, %d", reply[0])
-
-                self.transport.payload_out[0] = RPC.SET_TRIGGER
-                sidx = self.trigger.pack(self.transport.payload_out, 1)
-                self.transport.queue_rpc2(sidx, rpc_trigger_reply)
-                self.trigger.value = 0
-                self.dirty.trigger = False
-
-            if self.dirty.gains:
-
-                def rpc_gains_reply(reply: arr.array) -> None:
-                    if reply[0] != RPC.REPLY_GAINS:
-                        self.logger.error("Error RPC_REPLY_GAINS, %d", reply[0])
-
-                self.transport.payload_out[0] = RPC.SET_GAINS
-                sidx = self.gains.pack(self.transport.payload_out, 1)
-                self.transport.queue_rpc2(sidx, rpc_gains_reply)
-                self.dirty.gains = False
-
-            if self.dirty.command:
-
-                def rpc_command_reply(reply: arr.array) -> None:
-                    if reply[0] != RPC.REPLY_COMMAND:
-                        self.logger.error("Error RPC_REPLY_COMMAND, %d", reply[0])
-
-                if self.status.in_sync_mode:
-                    self.ts_last_syncd_motion = time.time()
-                else:
-                    self.ts_last_syncd_motion = 0
-                self.transport.payload_out[0] = RPC.SET_COMMAND
-                sidx = self.command.pack(self.transport.payload_out, 1)
-                self.transport.queue_rpc2(sidx, rpc_command_reply)
-                self.dirty.command = False
-
-            self.transport.step2(exiting=exiting)
-
-    def pull_status(self, exiting: bool = False) -> None:
-        if not self.hw_valid:
-            return
-
-        def rpc_read_gains_from_flash_reply(reply: arr.array) -> None:
-            if reply[0] == RPC.REPLY_READ_GAINS_FROM_FLASH:
-                self.gains, _ = self.gains.unpack(reply[1:])
-            else:
-                self.logger.error("Error RPC_REPLY_READ_GAINS_FROM_FLASH, %d", reply[0])
-
-        def rpc_status_reply(reply: arr.array) -> None:
-            if reply[0] == RPC.REPLY_STATUS:
-                self._status, _ = self.status.unpack(reply[1:])
-                self.timestamp.set(self.status.timestamp)
-            else:
-                self.logger.error("Error RPC_REPLY_STATUS, %d", reply[0])
-
-        with self.lock:
-            if self.dirty.read_gains_from_flash:
-                self.transport.payload_out[0] = RPC.READ_GAINS_FROM_FLASH
-                self.transport.queue_rpc(1, rpc_read_gains_from_flash_reply)
-                self.dirty.read_gains_from_flash = False
-
-            # Queue Status RPC.
-            self.transport.payload_out[0] = RPC.GET_STATUS
-            self.transport.queue_rpc(1, rpc_status_reply)
-            self.transport.step(exiting=exiting)
-
-    def set_load_test(self) -> None:
-        self.dirty.load_test = True
-
-    def set_motion_limits(self, limit_neg: float, limit_pos: float) -> None:
+    async def set_motion_limits(self, limit_neg: float, limit_pos: float) -> None:
         if limit_neg != self.motion_limits.limit_neg or limit_pos != self.motion_limits.limit_pos:
-
-            def rpc_motion_limits_reply(reply: arr.array) -> None:
-                if reply[0] != RPC.REPLY_MOTION_LIMITS:
-                    self.logger.error("Error RPC_REPLY_MOTION_LIMITS, %d", reply[0])
-
             with self.lock:
                 self.motion_limits.limit_neg, self.motion_limits.limit_pos = limit_neg, limit_pos
-                self.transport.payload_out[0] = RPC.SET_MOTION_LIMITS
-                sidx = self.motion_limits.pack(self.transport.payload_out, 1)
-                self.transport.queue_rpc2(sidx, rpc_motion_limits_reply)
-                self.transport.step2()
+                payload = arr.array("B", [RPC.SET_MOTION_LIMITS] + [0] * self.motion_limits.total_bytes())
+                self.motion_limits.pack(payload, 1)
+                reply = await self.transport.send(payload)
+                if reply[0] != RPC.REPLY_MOTION_LIMITS:
+                    self.logger.error("Error setting motion limits: %d", reply[0])
 
-    def set_gains(self, g: Gains) -> None:
-        with self.lock:
-            self.gains = copy.deepcopy(g)
-            self.dirty.gains = True
+    def motor_rad_to_translate_m(self, ang: float) -> float:
+        """Converts from motor radians to meters of translation.
 
-    def write_gains_to_flash(self) -> None:
-        with self.lock:
-            self.trigger.write_gains_to_flash = True
-            self.dirty.trigger = True
+        Args:
+            ang: The angle in radians
 
-    def read_gains_from_flash(self) -> None:
-        self.dirty.read_gains_from_flash = True
+        Returns:
+            The translated motion, derived from the motor properties
+        """
 
-    def board_reset(self) -> None:
-        with self.lock:
-            self.trigger.board_reset = True
-            self.dirty.trigger = True
+        cfg = self.params.chain
+        return ang * cfg.pitch * cfg.sprocket_teeth / (cfg.gr_spur * math.pi * 2)
 
-    def mark_position_on_contact(self, x: float) -> None:
-        with self.lock:
-            self.trigger_position = x
-            self.trigger.mark_pos_on_contact = True
-            self.dirty.trigger = True
+    def translate_m_to_motor_rad(self, x: float) -> float:
+        """Converts from meters of translation to motor radians.
 
-    def mark_position(self, x: float) -> None:
-        if self.status.mode != Mode.SAFETY:
-            self.logger.warning("Can not mark position. Must be in MODE_SAFETY")
-            return
+        Args:
+            x: The translated motion
 
-        with self.lock:
-            self.trigger_position = x
-            self.trigger.mark_pos = True
-            self.dirty.trigger = True
+        Returns:
+            The angle in radians, derived from the motor properties
+        """
 
-    def reset_motion_gen(self) -> None:
-        with self.lock:
-            self.trigger.reset_motion_gen = True
-            self.dirty.trigger = True
+        cfg = self.params.chain
+        return x * cfg.gr_spur * math.pi * 2 / (cfg.pitch * cfg.sprocket_teeth)
 
-    def reset_pos_calibrated(self) -> None:
-        with self.lock:
-            self.trigger.reset_pos_calibrated = True
-            self.dirty.trigger = True
-
-    def set_pos_calibrated(self) -> None:
-        with self.lock:
-            self.trigger.pos_calibrated = True
-            self.dirty.trigger = True
-
-    def enable_firmware_trace(self, value: bool = True) -> None:
-        assert isinstance(self.status, StatusP2), "Only supported on P2"
-        with self.lock:
-            self.trigger.enable_trace = value
-            self.dirty.trigger = True
-
-    def enable_safety(self) -> None:
-        self.set_command(mode=Mode.SAFETY)
-
-    def enable_freewheel(self) -> None:
-        self.set_command(mode=Mode.FREEWHEEL)
-
-    def enable_hold(self) -> None:
-        self.set_command(mode=Mode.HOLD)
-
-    def enable_vel_pid(self) -> None:
-        self.set_command(mode=Mode.VEL_PID, v_des=0)
-
-    def enable_pos_pid(self) -> None:
-        self.set_command(mode=Mode.POS_PID, x_des=self.status.pos)
-
-    def enable_vel_traj(self) -> None:
-        self.set_command(mode=Mode.VEL_TRAJ, v_des=0)
-
-    def enable_pos_traj(self) -> None:
-        self.set_command(mode=Mode.POS_TRAJ, x_des=self.status.pos)
-
-    def enable_pos_traj_incr(self) -> None:
-        self.set_command(mode=Mode.POS_TRAJ_INCR, x_des=0)
-
-    def enable_current(self) -> None:
-        self.set_command(mode=Mode.CURRENT, i_des=0)
-
-    def enable_sync_mode(self, value: bool = True) -> None:
-        self.gains.enable_sync_mode = value
-        self.dirty.gains = True
-
-    def enable_runstop(self, value: bool = True) -> None:
-        self.gains.enable_runstop = value
-        self.dirty.gains = True
-
-    def enable_guarded_mode(self, value: bool = True) -> None:
-        self.gains.enable_guarded_mode = value
-        self.dirty.gains = True
-
-    def set_command(
+    async def send_command(
         self,
         mode: int | None = None,
         x_des: float | None = None,
@@ -680,7 +525,23 @@ class Stepper(Device):
         i_contact_pos: float | None = None,
         i_contact_neg: float | None = None,
     ) -> None:
-        with self.lock:
+        """Runs the command with the given parameters.
+
+        If a parameter is missing, the value from the last command is used.
+
+        Args:
+            mode: The mode to run the stepper in.
+            x_des: The position to move to.
+            v_des: The velocity to move at.
+            a_des: The acceleration to move at.
+            i_des: The current to move at.
+            stiffness: The stiffness to move at.
+            i_feedforward: The current feedforward to move at.
+            i_contact_pos: The positive contact current to move at.
+            i_contact_neg: The negative contact current to move at.
+        """
+
+        async with self.lock:
             if mode is not None:
                 self.command.mode = mode
 
@@ -691,66 +552,33 @@ class Stepper(Device):
 
             if v_des is not None:
                 self.command.v_des = v_des
-            else:
-                if mode == Mode.VEL_PID or mode == Mode.VEL_TRAJ:
-                    self.command.v_des = 0
-                else:
-                    self.command.v_des = self.params.motion.vel
 
             if a_des is not None:
                 self.command.a_des = a_des
-            else:
-                self.command.a_des = self.params.motion.acc
 
             if stiffness is not None:
-                self.command.stiffness = max(0.0, min(1.0, stiffness))
-            else:
-                self.command.stiffness = 1.0
+                self.command.stiffness = stiffness
 
             if i_feedforward is not None:
                 self.command.i_feedforward = i_feedforward
-            else:
-                self.command.i_feedforward = 0.0
 
-            if i_des is not None and mode == Mode.CURRENT:
-                self.command.i_feedforward = i_des
+            if i_des is not None:
+                if self.command.mode == Mode.CURRENT:
+                    self.command.i_feedforward = i_des
+                else:
+                    self.logger.warning("i_des is ignored in non-current mode")
 
             if i_contact_pos is not None:
                 self.command.i_contact_pos = i_contact_pos
-            else:
-                self.command.i_contact_pos = self.params.gains.i_contact_pos
 
             if i_contact_neg is not None:
                 self.command.i_contact_neg = i_contact_neg
-            else:
-                self.command.i_contact_neg = self.params.gains.i_contact_neg
 
-        self.dirty.command = True
-
-    def poll_until(self, condition: Callable[[], bool], timeout: float = 15.0, sleep_time: float = 0.1) -> bool:
-        """Poll until is moving flag is false.
-
-        Args:
-            condition: Function that returns true when the condition is met.
-            timeout: Timeout in seconds.
-            sleep_time: Sleep time in seconds.
-
-        Returns:
-            True if is moving flag is false, False if timeout is reached.
-        """
-
-        ts = time.time()
-        self.pull_status()
-        while not (value := condition()) and time.time() - ts < timeout:
-            time.sleep(sleep_time)
-            self.pull_status()
-        return value
-
-    def wait_while_is_moving(self, timeout: float = 15.0, sleep_time: float = 0.1) -> bool:
-        return self.poll_until(lambda: not self.status.is_moving, timeout, sleep_time)
-
-    def wait_until_at_setpoint(self, timeout: float = 15.0, sleep_time: float = 0.1) -> bool:
-        return self.poll_until(lambda: self.status.near_pos_setpoint, timeout, sleep_time)
+            payload = arr.array("B", [RPC.SET_COMMAND] + [0] * self.command.total_bytes())
+            self.command.pack(payload, 1)
+            reply = await self.transport.send(payload)
+            if reply[0] != RPC.REPLY_COMMAND:
+                self.logger.error("Error setting command: %d", reply[0])
 
     def current_to_effort_ticks(self, i_A: float) -> int:
         if self.board_info.hardware_id == 0:
@@ -783,99 +611,33 @@ class Stepper(Device):
             return min(1.0, e_pct / 100.0) * self.gains.iMax_pos
         return max(-1.0, e_pct / 100.0) * abs(self.gains.iMax_neg)
 
-    def get_chip_id(self, sleep_time: float = 0.5) -> str:
-        self.turn_menu_interface_on()
-        time.sleep(sleep_time)
-        cid = self.menu_transaction(b"b")[0][:-2]
-        self.turn_rpc_interface_on()
-        time.sleep(sleep_time)
-        return cid.decode("utf-8")
+    def contact_thresh_to_motor_current(
+        self, contact_thresh_pos: float, contact_thresh_neg: float
+    ) -> tuple[float, float]:
+        e_cn = contact_thresh_neg
+        e_cp = contact_thresh_pos
+        contact_thresh_neg, contact_thresh_pos = self.params.calibration.contact_thresh_max
+        i_contact_neg = self.effort_pct_to_current(max(e_cn, contact_thresh_neg))
+        i_contact_pos = self.effort_pct_to_current(min(e_cp, contact_thresh_pos))
+        return i_contact_pos, i_contact_neg
 
-    def read_encoder_calibration_from_flash(self, sleep_time: float = 1.0) -> list[float]:
-        self.turn_menu_interface_on()
-        time.sleep(sleep_time)
-        self.logger.debug("Reading encoder calibration...")
-        e = self.menu_transaction(b"q")[19]
-        self.turn_rpc_interface_on()
-        self.push_command()
-        self.logger.debug("Resetting board")
-        self.board_reset()
-        self.push_command()
-        e = e[:-4].decode("utf-8")
-        enc_calib = []
-        while len(e):
-            ff = e.find(",")
-            if ff != -1:
-                enc_calib.append(float(e[:ff]))
-                e = e[ff + 2 :]
-            else:
-                enc_calib.append(float(e))
-                break
-        if len(enc_calib) == 16384:
-            self.logger.debug("Successful read of encoder calibration")
-        else:
-            self.logger.debug("Failed to read encoder calibration")
-        return enc_calib
+    async def turn_menu_interface_on(self) -> None:
+        reply = await self.transport.send(arr.array("B", [RPC.SET_MENU_ON]))
+        if reply[0] != RPC.REPLY_MENU_ON:
+            raise RuntimeError("Error getting chip id")
 
-    def write_encoder_calibration_to_flash(self, data: list[float]) -> None:
-        if not self.hw_valid:
-            return
-
-        def rpc_enc_calib_reply(reply: arr.array) -> None:
-            if reply[0] != RPC.REPLY_ENC_CALIB:
-                self.logger.debug("Error RPC_REPLY_ENC_CALIB", reply[0])
-
-        if len(data) != 16384:
-            self.logger.warning("Bad encoder data")
-
-        else:
-            self.logger.debug("Writing encoder calibration...")
-            for p in range(256):
-                if p % 10 == 0:
-                    sys.stdout.write(".")
-                    sys.stdout.flush()
-                self.transport.payload_out[0] = RPC.SET_ENC_CALIB
-                self.transport.payload_out[1] = p
-                sidx = 2
-                for i in range(64):
-                    pack(data[p * 64 + i], "float", self.transport.payload_out, sidx)
-                    sidx += 4
-                self.transport.queue_rpc(sidx, rpc_enc_calib_reply)
-                self.transport.step()
-
-    def turn_rpc_interface_on(self) -> None:
-        with self.lock:
-            self.menu_transaction(b"zyx")
-
-    def turn_menu_interface_on(self) -> None:
-        if not self.hw_valid:
-            return
-
-        def rpc_menu_on_reply(reply: arr.array) -> None:
-            if reply[0] != RPC.REPLY_MENU_ON:
-                self.logger.error("Error RPC_REPLY_MENU_ON, %d", reply[0])
-
-        with self.lock:
-            self.transport.payload_out[0] = RPC.SET_MENU_ON
-            self.transport.queue_rpc(1, rpc_menu_on_reply)
-            self.transport.step()
-
-    def log_menu(self) -> None:
-        with self.lock:
-            self.menu_transaction(b"m")
-
-    def menu_transaction(
+    async def menu_transaction(
         self,
         x: bytes | bytearray | memoryview | str,
-        sleep_time: float = 0.1,
+        sleep_time: float = 0.01,
         do_log: bool = False,
     ) -> list[bytes]:
-        if not self.hw_valid:
-            return []
+        if self.transport.ser is None:
+            raise RuntimeError("Serial port not open")
 
         with self.lock:
             self.transport.ser.write(x)
-            time.sleep(sleep_time)
+            await asyncio.sleep(sleep_time)
             reply = []
             while self.transport.ser.inWaiting():
                 r = self.transport.ser.readline()
@@ -887,197 +649,47 @@ class Stepper(Device):
                 reply.append(r)
             return reply
 
-    def enable_pos_traj_waypoint(self) -> None:
-        assert isinstance(self.status, StatusP1), "Only supported on P1"
-        self.set_command(mode=Mode.POS_TRAJ_WAYPOINT)
+    async def turn_rpc_inferface_on(self) -> None:
+        await self.menu_transaction(b"zyx")
 
-    def start_waypoint_trajectory(self, duration: float, coefs: PolyCoefs, segment_id: int) -> bool:
-        """Starts execution of a waypoint trajectory on hardware.
+    async def get_chip_id(self) -> str:
+        await self.turn_menu_interface_on()
+        cid = (await self.menu_transaction(b"b"))[0][:-2]
+        await self.turn_rpc_interface_on()
+        return cid.decode("utf-8")
 
-        Args:
-            duration: Duration of the trajectory in seconds.
-            coefs: Polynomial coefficients for the trajectory.
-            segment_id: Segment ID of the trajectory.
+    async def home(self, to_positive_stop: bool = True) -> None:
+        contact_thresh_neg, contact_thresh_pos = self.params.calibration.contact_thresh_max
 
-        Returns:
-            If uC successfully initiated a new trajectory
-        """
-
-        assert isinstance(self.status, StatusP1), "Only supported on P1"
-
-        a0, a1, a2, a3, a4, a5 = coefs
-        self.waypoint_traj = WaypointTrajectory(
-            duration=duration,
-            a0=a0,
-            a1=a1,
-            a2=a2,
-            a3=a3,
-            a4=a4,
-            a5=a5,
-            segment_id=segment_id,
-            timestamp=time.time(),
-        )
-
-        def rpc_start_new_traj_reply(reply: arr.array) -> None:
-            if reply[0] == RPC.REPLY_START_NEW_TRAJECTORY:
-                with self.lock:
-                    self.waypoint_traj_response, _ = WaypointTrajectoryResponse.unpack(reply[1:])
-            else:
-                self.logger.error("RPC_REPLY_START_NEW_TRAJECTORY replied %d", reply[0])
-
-        with self.lock:
-            if self.waypoint_traj is not None:
-                self.transport.payload_out[0] = RPC.START_NEW_TRAJECTORY
-                sidx = self.waypoint_traj.pack(self.transport.payload_out, 1)
-                self.transport.queue_rpc2(sidx, rpc_start_new_traj_reply)
-            self.transport.step2()
-            if self.waypoint_traj_response is None:
-                return False
-            if not self.waypoint_traj_response.start_success:
-                self.logger.warning(
-                    "start_waypoint_trajectory: %s",
-                    self.waypoint_traj_response.start_error_msg.capitalize(),
-                )
-            return self.waypoint_traj_response.start_success > 0
-
-    def set_next_trajectory_segment(self, duration: float, coefs: PolyCoefs, segment_id: int) -> bool:
-        """Sets the next segment for the hardware to execute
-
-        This method is generally called multiple times while the prior segment
-        is executing. This provides the hardware with the next segment to
-        gracefully transition across the entire spline, while allowing users to
-        preempt or modify the future trajectory in real time.
-
-        This method will return False if there is not already an segment
-        executing on the uC.
-
-        Args:
-            duration: Duration of the trajectory in seconds.
-            coefs: Polynomial coefficients for the trajectory.
-            segment_id: Segment ID of the trajectory.
-
-        Returns:
-            True if uC successfully queued next trajectory
-        """
-
-        assert isinstance(self.status, StatusP1), "Only supported on P1"
-
-        if self.waypoint_traj is not None:
-            self.waypoint_traj.duration = duration
-            self.waypoint_traj.a0 = coefs[0]
-            self.waypoint_traj.a1 = coefs[1]
-            self.waypoint_traj.a2 = coefs[2]
-            self.waypoint_traj.a3 = coefs[3]
-            self.waypoint_traj.a4 = coefs[4]
-            self.waypoint_traj.a5 = coefs[5]
-            self.waypoint_traj.segment_id = segment_id
-
-        def rpc_set_next_traj_seg_reply(reply: arr.array) -> None:
-            if reply[0] == RPC.REPLY_SET_NEXT_TRAJECTORY_SEG:
-                with self.lock:
-                    self.waypoint_next_traj_response, _ = WaypointTrajectoryResponse.unpack(reply[1:])
-            else:
-                self.logger.error("RPC_REPLY_SET_NEXT_TRAJECTORY_SEG replied %s", reply[0])
-
-        with self.lock:
-            if self.waypoint_traj is not None:
-                self.transport.payload_out[0] = RPC.SET_NEXT_TRAJECTORY_SEG
-                sidx = self.waypoint_traj.pack(self.transport.payload_out, 1)
-                self.transport.queue_rpc2(sidx, rpc_set_next_traj_seg_reply)
-            self.transport.step2()
-            if self.waypoint_next_traj_response is None:
-                return False
-            if not self.waypoint_next_traj_response.start_success:
-                self.logger.warning(
-                    "set_next_trajectory_segment: %s",
-                    self.waypoint_next_traj_response.start_error_msg.capitalize(),
-                )
-            return self.waypoint_next_traj_response.start_success > 0
-
-    def stop_waypoint_trajectory(self) -> None:
-        """Stops execution of the waypoint trajectory running in hardware."""
-
-        assert isinstance(self.status, StatusP1), "Only supported on P1"
-
-        def rpc_reset_traj_reply(reply: arr.array) -> None:
-            if reply[0] != RPC.REPLY_RESET_TRAJECTORY:
-                self.logger.error("RPC_REPLY_RESET_TRAJECTORY replied %d", reply[0])
-
-        self._waypoint_ts = None
-        with self.lock:
-            self.transport.payload_out[0] = RPC.RESET_TRAJECTORY
-            self.transport.queue_rpc2(1, rpc_reset_traj_reply)
-            self.transport.step2()
-
-    def read_firmware_trace(self, timeout: float = 60.0, sleep_time: float = 0.001) -> None:
-        assert isinstance(self.status, StatusP2), "Only supported on P2"
-
-        def rpc_read_firmware_trace_reply(reply: arr.array) -> None:
-            if len(reply) > 0 and reply[0] == RPC.REPLY_READ_TRACE:
-                self.n_trace_read = reply[1]
-
-                if reply[2] == TraceType.STATUS:
-                    self.status_trace, _ = StatusP2.unpack(reply[3:])
-                    self.timestamp.set(self.status_trace.timestamp)
-                elif reply[2] == TraceType.DEBUG:
-                    self.debug_trace, _ = DebugTrace.unpack(reply[3:])
-                elif reply[2] == TraceType.PRINT:
-                    self.print_trace, _ = PrintTrace.unpack(reply[3:])
-                else:
-                    self.logger.error("Unrecognized trace type %d", reply[2])
-
-            else:
-                self.logger.error("RPC_REPLY_READ_TRACE")
-                self.n_trace_read = 0
-
-        with self.lock:
-            self.timestamp.reset()  # Timestamp holds state, reset within lock to avoid threading issues
-            self.n_trace_read = 1
-            ts = time.time()
-
-            while self.n_trace_read > 0 and time.time() - ts < timeout:
-                self.transport.payload_out[0] = RPC.READ_TRACE
-                self.transport.queue_rpc(1, rpc_read_firmware_trace_reply)
-                self.transport.step()
-                time.sleep(sleep_time)
-
-    def home(self) -> None:
         prev_guarded = self.params.gains.enable_guarded_mode
         prev_sync = self.params.gains.enable_sync_mode
 
-        self.enable_guarded_mode()
-        self.enable_sync_mode(False)
-        self.reset_pos_calibrated()
+        # Sets gains.
+        self.gains.enable_guarded_mode = True
+        self.gains.enable_sync_mode = False
+        await self.send_gains()
 
-        self.push_command()
-        self.pull_status()
+        # Sets trigger.
+        await self.send_trigger(reset_pos_calibrated=True)
 
-        self.enable_guarded_mode(prev_guarded)
-        self.enable_sync_mode(prev_sync)
-        self.push_command()
+        # Move to first endstop.
+        i_contact_pos, i_contact_neg = self.contact_thresh_to_motor_current(contact_thresh_pos, contact_thresh_neg)
+        await self.send_command(
+            mode=Mode.POS_TRAJ_INCR,
+            x_des=self.translate_m_to_motor_rad(5.0 if to_positive_stop else -5.0),
+            i_contact_neg=i_contact_neg,
+            i_contact_pos=i_contact_pos,
+        )
 
-    def motor_rad_to_translate_m(self, ang: float) -> float:
-        """Converts from motor radians to meters of translation.
+        # Move to second endstop.
+        await self.send_command(
+            mode=Mode.POS_TRAJ_INCR,
+            x_des=self.translate_m_to_motor_rad(-5.0 if to_positive_stop else 5.0),
+            i_contact_neg=i_contact_neg,
+            i_contact_pos=i_contact_pos,
+        )
 
-        Args:
-            ang: The angle in radians
-
-        Returns:
-            The translated motion, derived from the motor properties
-        """
-
-        cfg = self.params.chain
-        return ang * cfg.pitch * cfg.sprocket_teeth / (cfg.gr_spur * math.pi * 2)
-
-    def translate_m_to_motor_rad(self, x: float) -> float:
-        """Converts from meters of translation to motor radians.
-
-        Args:
-            x: The translated motion
-
-        Returns:
-            The angle in radians, derived from the motor properties
-        """
-
-        cfg = self.params.chain
-        return x * cfg.gr_spur * math.pi * 2 / (cfg.pitch * cfg.sprocket_teeth)
+        # Reverts guard mode.
+        self.gains.enable_guarded_mode = prev_guarded
+        self.gains.enable_sync_mode = prev_sync
+        await self.send_gains()

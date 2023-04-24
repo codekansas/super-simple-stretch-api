@@ -1,11 +1,9 @@
 import array as arr
-import copy
+import asyncio
 import fcntl
 import logging
-import time
-from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Deque
+from typing import Literal, overload
 
 import serial
 
@@ -41,12 +39,13 @@ class Status:
 
 
 class Transport:
-    def __init__(self, usb: str) -> None:
+    def __init__(self, usb: str, name: str | None = None, write_timeout: float = 1.0) -> None:
+        self.name = usb[5:] if name is None else name
         self.usb = usb
-        self.logger = logging.getLogger(f"transport.{usb}")
+        self.write_timeout = write_timeout
 
-        self.payload_out = arr.array("B", [0] * (RPC.DATA_SIZE + 1))
-        self.payload_in = arr.array("B", [0] * (RPC.DATA_SIZE + 1))
+        self.logger = logging.getLogger(f"transport.{self.name}")
+        self.lock = asyncio.Lock()
         self.buf = arr.array("B", [0] * (RPC.BLOCK_SIZE * 2))
 
         self.write_error = 0
@@ -55,28 +54,9 @@ class Transport:
         self.itr_time = 0.0
         self.tlast = 0.0
 
-        self.rpc_queue: Deque[tuple[arr.array, Callable[[arr.array], None]]] = deque()
-        self.rpc_queue2: Deque[tuple[arr.array, Callable[[arr.array], None]]] = deque()
-
         self.logger.debug("Starting connection")
 
-        try:
-            self.ser = serial.Serial(self.usb, write_timeout=1.0)
-            if self.ser.isOpen():
-                fcntl.flock(self.ser.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-        except serial.SerialException:
-            self.logger.exception("Exception while opening serial port")
-            self.ser = None
-
-        except IOError:
-            self.logger.exception("Device is busy. Check if another Stretch Body process is already running.")
-            self.ser.close()
-            self.ser = None
-
-        if self.ser is None:
-            self.logger.warning("Unable to open serial port for device.")
-
+        self.ser: serial.Serial | None = None
         self.framer = CobbsFraming()
         self.status = Status(
             rate=0,
@@ -87,159 +67,95 @@ class Transport:
             transaction_time_max=0,
         )
 
-    def startup(self) -> bool:
-        try:
-            self.ser = serial.Serial(self.usb, write_timeout=1.0)
-            if self.ser.isOpen():
-                fcntl.flock(self.ser.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    async def startup(self) -> None:
+        assert self.ser is None, "Serial port already open"
+        async with self.lock:
+            self.ser = serial.Serial(self.usb, write_timeout=self.write_timeout)
+            assert self.ser.isOpen(), "Serial port not open"
+            fcntl.flock(self.ser.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.logger.debug("Serial port open")
 
-        except serial.SerialException:
-            self.logger.exception("Exception while opening serial port")
-            self.ser = None
-
-        except IOError:
-            self.logger.exception("Port is busy. Check if another Stretch Body process is already running")
+    async def stop(self) -> None:
+        assert self.ser is not None, "Serial port not open"
+        async with self.lock:
+            self.ser.reset_output_buffer()
+            self.ser.reset_input_buffer()
             self.ser.close()
             self.ser = None
+            self.logger.debug("Serial port closed")
 
+    @overload
+    async def send(self, rpc: arr.array, *, timeout: float = 0.2) -> arr.array:
+        ...
+
+    @overload
+    async def send(self, rpc: arr.array, *, timeout: float = 0.2, throw_on_error: Literal[False]) -> arr.array | None:
+        ...
+
+    async def send(self, rpc: arr.array, *, timeout: float = 0.2, throw_on_error: bool = True) -> arr.array | None:
         if self.ser is None:
-            self.logger.warning("Unable to open serial port for device.")
+            raise IOError("Device is not connected; run `transport.startup()` first")
 
-        return self.ser is not None
-
-    def stop(self) -> None:
-        if self.ser is not None:
-            self.logger.debug("Shutting down")
-            self.ser.close()
-            self.ser = None
-
-    def queue_rpc(self, n: int, reply_callback: Callable[[arr.array], None]) -> None:
-        if self.ser is not None:
-            self.rpc_queue.append((copy.copy(self.payload_out[:n]), reply_callback))
-
-    def queue_rpc2(self, n: int, reply_callback: Callable[[arr.array], None]) -> None:
-        if self.ser is not None:
-            self.rpc_queue2.append((copy.copy(self.payload_out[:n]), reply_callback))
-
-    def step_rpc(self, rpc: arr.array, rpc_callback: Callable[[arr.array], None], timeout: float = 0.2) -> None:
-        """Handles a single RPC transaction.
-
-        Args:
-            rpc: The RPC to send
-            rpc_callback: The callback to call when the RPC is complete
-            timeout: The timeout for the RPC
-        """
-
-        if self.ser is None:
-            self.logger.debug("Transport serial not present")
-            return
-
-        try:
-            time.time()
-            self.buf[0] = RPC.START_NEW_RPC
-            self.framer.send_framed_data(self.buf, 1, self.ser)
-            crc, nr = self.framer.receive_framed_data(self.buf, self.ser, timeout=timeout)
-
-            if crc != 1 or self.buf[0] != RPC.ACK_NEW_RPC:
-                raise TransportError(f"Transport RX Error on ACK_NEW_RPC {crc} {nr} {self.buf[0]}")
-            ntx = 0
-
-            while ntx < len(rpc):
-                nb = min(len(rpc) - ntx, RPC.BLOCK_SIZE)  # Number of bytes to send
-                b = rpc[ntx : ntx + nb]
-                ntx = ntx + nb
-                if ntx == len(rpc):  # Last block
-                    self.buf[0] = RPC.SEND_BLOCK_LAST
-                    self.buf[1 : len(b) + 1] = b
-                    self.framer.send_framed_data(self.buf, nb + 1, self.ser)
-                    crc, nr = self.framer.receive_framed_data(self.buf, self.ser)
-                    if crc != 1 or self.buf[0] != RPC.ACK_SEND_BLOCK_LAST:
-                        raise TransportError(f"Transport RX Error on ACK_SEND_BLOCK_LAST {crc} {nr} {self.buf[0]}")
-                else:
-                    self.buf[0] = RPC.SEND_BLOCK_MORE
-                    self.buf[1 : len(b) + 1] = b
-                    self.framer.send_framed_data(self.buf, nb + 1, self.ser)
-                    crc, nr = self.framer.receive_framed_data(self.buf, self.ser)
-                    if crc != 1 or self.buf[0] != RPC.ACK_SEND_BLOCK_MORE:
-                        raise TransportError(f"Transport RX Error on ACK_SEND_BLOCK_MORE {crc} {nr} {self.buf[0]}")
-
-            reply = arr.array("B")
-            while True:
-                self.buf[0] = RPC.GET_BLOCK
+        async with self.lock:
+            try:
+                # Sends START_NEW_RPC
+                self.buf[0] = RPC.START_NEW_RPC
                 self.framer.send_framed_data(self.buf, 1, self.ser)
-                crc, nr = self.framer.receive_framed_data(self.buf, self.ser)
-                if crc != 1 or not (self.buf[0] == RPC.ACK_GET_BLOCK_MORE or self.buf[0] == RPC.ACK_GET_BLOCK_LAST):
-                    raise TransportError(f"Transport RX Error on GET_BLOCK {crc} {nr} {self.buf[0]}")
-                reply = reply + self.buf[1:nr]
+                crc, nr = self.framer.receive_framed_data(self.buf, self.ser, timeout=timeout)
 
-                if self.buf[0] == RPC.ACK_GET_BLOCK_LAST:
-                    break
-            rpc_callback(reply)
+                if crc != 1 or self.buf[0] != RPC.ACK_NEW_RPC:
+                    raise TransportError(f"Transport RX Error on ACK_NEW_RPC {crc} {nr} {self.buf[0]}")
 
-        except TransportError:
-            self.logger.exception("Exception while communicating with device")
-            self.read_error = self.read_error + 1
-            self.ser.reset_output_buffer()
-            self.ser.reset_input_buffer()
+                ntx = 0
+                while ntx < len(rpc):
+                    # Number of bytes to send
+                    nb = min(len(rpc) - ntx, RPC.BLOCK_SIZE)
+                    b = rpc[ntx : ntx + nb]
+                    ntx = ntx + nb
 
-        except (serial.SerialTimeoutException, serial.SerialException, TypeError):
-            self.logger.exception("Exception while communicating with device")
-            self.write_error += 1
-            self.ser = None
+                    if ntx == len(rpc):  # Last block
+                        self.buf[0] = RPC.SEND_BLOCK_LAST
+                        self.buf[1 : len(b) + 1] = b
+                        self.framer.send_framed_data(self.buf, nb + 1, self.ser)
+                        crc, nr = self.framer.receive_framed_data(self.buf, self.ser)
+                        if crc != 1 or self.buf[0] != RPC.ACK_SEND_BLOCK_LAST:
+                            raise TransportError(f"Transport RX Error on ACK_SEND_BLOCK_LAST {crc} {nr} {self.buf[0]}")
 
-    def step(self, exiting: bool = False) -> None:
-        if not self.ser:
-            return
+                    else:
+                        self.buf[0] = RPC.SEND_BLOCK_MORE
+                        self.buf[1 : len(b) + 1] = b
+                        self.framer.send_framed_data(self.buf, nb + 1, self.ser)
+                        crc, nr = self.framer.receive_framed_data(self.buf, self.ser)
+                        if crc != 1 or self.buf[0] != RPC.ACK_SEND_BLOCK_MORE:
+                            raise TransportError(f"Transport RX Error on ACK_SEND_BLOCK_MORE {crc} {nr} {self.buf[0]}")
 
-        if exiting:
-            time.sleep(0.1)
-            self.ser.reset_output_buffer()
-            self.ser.reset_input_buffer()
+                reply = arr.array("B")
+                while True:
+                    self.buf[0] = RPC.GET_BLOCK
+                    self.framer.send_framed_data(self.buf, 1, self.ser)
+                    crc, nr = self.framer.receive_framed_data(self.buf, self.ser)
+                    if crc != 1 or not (self.buf[0] == RPC.ACK_GET_BLOCK_MORE or self.buf[0] == RPC.ACK_GET_BLOCK_LAST):
+                        raise TransportError(f"Transport RX Error on GET_BLOCK {crc} {nr} {self.buf[0]}")
+                    reply = reply + self.buf[1:nr]
 
-        try:
-            self.itr += 1
-            self.itr_time = time.time() - self.tlast
-            self.tlast = time.time()
+                    if self.buf[0] == RPC.ACK_GET_BLOCK_LAST:
+                        break
 
-            while len(self.rpc_queue):
-                rpc, reply_callback = self.rpc_queue.popleft()
-                self.step_rpc(rpc, reply_callback)
+                return reply
 
-        except serial.SerialTimeoutException:
-            self.logger.exception("Exception while communicating with device")
-            self.write_error += 1
+            except TransportError:
+                self.read_error = self.read_error + 1
+                self.ser.reset_output_buffer()
+                self.ser.reset_input_buffer()
+                if throw_on_error:
+                    raise
+                self.logger.exception("Exception while communicating with device")
 
-        except IOError:
-            self.logger.exception("Exception while communicating with device")
-            self.read_error += 1
+            except (serial.SerialTimeoutException, serial.SerialException, TypeError):
+                self.write_error += 1
+                self.ser = None
+                if throw_on_error:
+                    raise
+                self.logger.exception("Exception while communicating with device")
 
-        # Update status
-        if self.itr_time != 0:
-            self.status.rate = 1 / self.itr_time
-        else:
-            self.status.rate = 0.0
-        self.status.read_error = self.read_error
-        self.status.write_error = self.write_error
-        self.status.itr = self.itr
-
-    def step2(self, exiting: bool = False) -> None:
-        if not self.ser:
-            return
-
-        if exiting:
-            time.sleep(0.1)
-            self.ser.reset_output_buffer()
-            self.ser.reset_input_buffer()
-
-        try:
-            while self.rpc_queue2:
-                rpc, reply_callback = self.rpc_queue2.popleft()
-                self.step_rpc(rpc, reply_callback)
-
-        except serial.SerialTimeoutException:
-            self.logger.exception("Exception while communicating with device")
-            self.write_error += 1
-
-        except IOError:
-            self.logger.exception("Exception while communicating with device")
-            self.read_error += 1
+        return None

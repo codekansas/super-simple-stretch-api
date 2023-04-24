@@ -2,7 +2,7 @@ import argparse
 import asyncio
 import logging
 
-from stretch.motors.async_stepper import AsyncStepper, Mode
+from stretch.motors.stepper import Mode, Stepper
 from stretch.utils.config import Config
 from stretch.utils.logging import configure_logging
 
@@ -22,7 +22,7 @@ async def main() -> None:
     if args.device not in config.stepper:
         raise ValueError(f"Device '{args.device}' not found in the config file")
     stepper_config = config.stepper[args.device]
-    stepper = AsyncStepper(stepper_config)
+    stepper = Stepper(stepper_config)
 
     # Starts the stepper motor.
     await stepper.startup()
@@ -35,7 +35,7 @@ async def main() -> None:
 
     await stepper.send_trigger(reset_pos_calibrated=True)
 
-    await stepper.run_command(
+    await stepper.send_command(
         mode=Mode.POS_TRAJ_INCR,
         x_des=stepper.translate_m_to_motor_rad(0.05),
     )
